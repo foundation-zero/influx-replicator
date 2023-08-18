@@ -1,0 +1,20 @@
+services:
+  influxdb:
+    image: influxdb:latest
+    ports:
+      - "${INFLUXDB_SINK_PORT}:8086"
+    volumes:
+      - ./docker/influxdb:/var/lib/influxdb2:rw
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_SINK_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_SINK_PASS}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_SINK_ORGANISATION}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_SINK_BUCKET}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_SINK_TOKEN}
+    restart: unless-stopped
+    logging: &logging
+      driver: "json-file"
+      options:
+        max-file: "3"
+        max-size: "50m"

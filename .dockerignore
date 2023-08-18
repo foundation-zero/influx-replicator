@@ -1,0 +1,4 @@
+docker/**
+target
+!target/x86_64-unknown-linux-musl/release/influx-replicator
+!target/aarch64-unknown-linux-musl/release/influx-replicator
