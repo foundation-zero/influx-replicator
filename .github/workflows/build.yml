@@ -1,0 +1,138 @@
+name: Build influx replicator
+on:
+  push:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features
+
+  build:
+    permissions:
+      contents: read
+      packages: write
+    runs-on: ubuntu-latest
+    needs:
+      - check
+
+    strategy:
+      matrix:
+        platform:
+          - release_for: Linux_x86_64
+            target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+          
+          - release_for: Linux_arm64
+            target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+          toolchain: stable
+      
+      # Building is done by cross, which itself runs a docker, so it integrates very poorly inside a traditional Dockerfile build
+      # Instead build before hand and then copy into Scratch docker
+      - uses: ClementTsang/cargo-action@v0.0.4
+        with:
+          command: build
+          use-cross: true
+          args: --release --bin influx-replicator --target ${{ matrix.platform.target }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v4
+        with:
+          context: "."
+          platforms: ${{ matrix.platform.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          outputs: type=image,name=${{ env.REGISTRY_IMAGE }},name-canonical=true,push=true
+          build-args: TARGET=${{ matrix.platform.target }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    permissions:
+      contents: read
+      packages: write
+
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
