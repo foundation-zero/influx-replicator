@@ -33,22 +33,22 @@ use bytes::BufMut;
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about=None)]
 struct Args {
-    #[arg(env = "INFLUXDB_SOURCE_URL")]
+    #[arg(env = "INFLUXDB_SOURCE_URL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_src_url: String,
-    #[arg(env = "INFLUXDB_SOURCE_ORGANISATION")]
+    #[arg(env = "INFLUXDB_SOURCE_ORGANISATION", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_src_org: String,
-    #[arg(env = "INFLUXDB_SOURCE_TOKEN")]
+    #[arg(env = "INFLUXDB_SOURCE_TOKEN", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_src_token: String,
-    #[arg(env = "INFLUXDB_SOURCE_BUCKET")]
+    #[arg(env = "INFLUXDB_SOURCE_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_src_bucket: String,
 
-    #[arg(env = "INFLUXDB_SINK_URL")]
+    #[arg(env = "INFLUXDB_SINK_URL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_url: String,
-    #[arg(env = "INFLUXDB_SINK_ORGANISATION")]
+    #[arg(env = "INFLUXDB_SINK_ORGANISATION", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_org: String,
-    #[arg(env = "INFLUXDB_SINK_TOKEN")]
+    #[arg(env = "INFLUXDB_SINK_TOKEN", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_token: String,
-    #[arg(env = "INFLUXDB_SINK_BUCKET")]
+    #[arg(env = "INFLUXDB_SINK_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_bucket: String,
 
     #[arg(env= "LOG_LEVEL", default_value_t=LevelFilter::Info)]
