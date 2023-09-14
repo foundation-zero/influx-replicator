@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::io::{self, Write};
 use std::iter;
-use std::ops::Add;
+
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -10,7 +10,7 @@ use async_stream::stream;
 
 use anyhow::Error;
 use chrono::{DateTime, Duration, FixedOffset, Utc};
-use clokwerk::{AsyncScheduler, Job, TimeUnits};
+use clokwerk::{AsyncScheduler, TimeUnits};
 use env_logger::{Builder, Target};
 use fallible_iterator::FallibleIterator;
 
@@ -133,14 +133,9 @@ async fn main() {
                 .await;
             }
 
-            let at = Utc::now()
-                .naive_local()
-                .time()
-                .add(Duration::milliseconds(100));
             let mut scheduler = AsyncScheduler::with_tz(Utc);
             scheduler
                 .every((*interval_minutes).minutes())
-                .at_time(at)
                 .run(move || {
                     let args = args.clone();
                     let is_running = is_running.clone();
