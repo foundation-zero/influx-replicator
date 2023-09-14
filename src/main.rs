@@ -76,6 +76,7 @@ struct Args {
     batch_minutes: i64,
 
     #[arg(
+        env = "PAGE_MAX_ROW_AMOUNT",
         default_value_t = 400000usize,
         help = "Maximum amount of rows in a single request"
     )]
