@@ -83,6 +83,13 @@ struct Args {
     )]
     max_rows: usize,
 
+    #[arg(
+        env = "REQUEST_RETRIES",
+        default_value_t = 3,
+        help = "Number of retries made to reads and writes"
+    )]
+    request_retries: usize,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -236,6 +243,7 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                     tx,
                     read_args.simul_batches,
                     read_args.max_rows,
+                    read_args.request_retries,
                 )
                 .await
             });
@@ -247,6 +255,7 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                     &write_args.influx_sink_org,
                     &write_args.influx_sink_bucket,
                     &mut rx,
+                    write_args.request_retries,
                 )
                 .await
             });
@@ -335,9 +344,12 @@ async fn write_batches(
     org: &str,
     bucket: &str,
     rx: &mut Receiver<Arc<Input>>,
+    retries: usize,
 ) -> Result<(), Error> {
     while let Some(item) = rx.recv().await {
-        let retry_strategy = ExponentialBackoff::from_millis(100).map(jitter).take(3);
+        let retry_strategy = ExponentialBackoff::from_millis(100)
+            .map(jitter)
+            .take(retries);
 
         Retry::spawn(retry_strategy, || {
             write_batch(client, org, bucket, item.clone())
@@ -372,6 +384,7 @@ async fn stream_batches<'a>(
     tx: mpsc::Sender<Arc<Input>>,
     simul_batches: usize,
     max_rows: usize,
+    retries: usize,
 ) -> Result<(), Error> {
     let mut futs = FuturesOrdered::new();
 
@@ -381,7 +394,7 @@ async fn stream_batches<'a>(
     let len = batches.len();
 
     for (i, (start, stop)) in batches.iter().enumerate() {
-        let fut = async move { stream_batch(client, bucket, start, stop, max_rows).await };
+        let fut = async move { stream_batch(client, bucket, start, stop, max_rows, retries).await };
         futs.push_back(fut);
 
         if futs.len() == simul_batches {
@@ -435,12 +448,14 @@ async fn stream_batch(
     start: &DateTime<FixedOffset>,
     stop: &DateTime<FixedOffset>,
     max_rows: usize,
+    retries: usize,
 ) -> Result<Vec<QueryRes>, Error> {
     let mut offset = BatchStart(0);
     let mut results: Vec<QueryRes> = Vec::new();
     loop {
-        let retry_strategy = ExponentialBackoff::from_millis(100).map(jitter).take(3);
-
+        let retry_strategy = ExponentialBackoff::from_millis(100)
+            .map(jitter)
+            .take(retries);
         match Retry::spawn(retry_strategy, || {
             read_batch(client, bucket, start, stop, offset, max_rows)
         })
