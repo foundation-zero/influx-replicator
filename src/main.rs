@@ -2,7 +2,6 @@ use std::fmt::Display;
 use std::io::{self, Write};
 use std::iter;
 
-
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -29,6 +28,8 @@ use tokio::sync::Mutex;
 use clap::{Parser, Subcommand};
 
 use bytes::BufMut;
+use tokio_retry::strategy::{jitter, ExponentialBackoff};
+use tokio_retry::Retry;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about=None)]
@@ -135,23 +136,21 @@ async fn main() {
             }
 
             let mut scheduler = AsyncScheduler::with_tz(Utc);
-            scheduler
-                .every((*interval_minutes).minutes())
-                .run(move || {
-                    let args = args.clone();
-                    let is_running = is_running.clone();
-                    async move {
-                        // prevent tasks from overlapping
-                        if is_running.try_lock().is_ok() {
-                            wrap_task("Scheduled Partial Sync", || async {
-                                sync(args, SyncType::Partial).await
-                            })
-                            .await;
-                        } else {
-                            info!("Skipping sync, because another sync is already running");
-                        }
+            scheduler.every((*interval_minutes).minutes()).run(move || {
+                let args = args.clone();
+                let is_running = is_running.clone();
+                async move {
+                    // prevent tasks from overlapping
+                    if is_running.try_lock().is_ok() {
+                        wrap_task("Scheduled Partial Sync", || async {
+                            sync(args, SyncType::Partial).await
+                        })
+                        .await;
+                    } else {
+                        info!("Skipping sync, because another sync is already running");
                     }
-                });
+                }
+            });
             loop {
                 scheduler.run_pending().await;
                 tokio::time::sleep(Duration::milliseconds(100).to_std().unwrap()).await;
@@ -338,7 +337,12 @@ async fn write_batches(
     rx: &mut Receiver<Arc<Input>>,
 ) -> Result<(), Error> {
     while let Some(item) = rx.recv().await {
-        write_batch(client, org, bucket, item).await?;
+        let retry_strategy = ExponentialBackoff::from_millis(100).map(jitter).take(3);
+
+        Retry::spawn(retry_strategy, || {
+            write_batch(client, org, bucket, item.clone())
+        })
+        .await?;
     }
     Ok(())
 }
@@ -416,6 +420,7 @@ async fn stream_batches<'a>(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 struct BatchStart(usize);
 
 impl Display for BatchStart {
@@ -434,7 +439,13 @@ async fn stream_batch(
     let mut offset = BatchStart(0);
     let mut results: Vec<QueryRes> = Vec::new();
     loop {
-        match read_batch(client, bucket, start, stop, offset, max_rows).await? {
+        let retry_strategy = ExponentialBackoff::from_millis(100).map(jitter).take(3);
+
+        match Retry::spawn(retry_strategy, || {
+            read_batch(client, bucket, start, stop, offset, max_rows)
+        })
+        .await?
+        {
             BatchResult::Unfinished(result, new_offset) => {
                 offset = new_offset;
                 results.push(result);
