@@ -13,10 +13,10 @@ use clokwerk::{AsyncScheduler, TimeUnits};
 use env_logger::{Builder, Target};
 use fallible_iterator::FallibleIterator;
 
-use futures::stream::FuturesOrdered;
+use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{join, Future, StreamExt};
 use influxdb2::api::query::{FluxRecord, QueryTableIter};
-use influxdb2::models::{Query, WriteDataPoint};
+use influxdb2::models::Query;
 use influxdb2::Client;
 use influxdb2_structmap::value::Value;
 use itertools::Itertools;
@@ -52,33 +52,40 @@ struct Args {
     #[arg(env = "INFLUXDB_SINK_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_bucket: String,
 
-    #[arg(env= "LOG_LEVEL", default_value_t=LevelFilter::Info)]
+    #[arg(short, long, env= "LOG_LEVEL", default_value_t=LevelFilter::Info)]
     log_level: LevelFilter,
 
     #[arg(
         env = "SIMULTANEOUS_BATCHES",
-        default_value_t = 10,
-        help = "Amount of workers simultaneously requesting from source"
+        default_value_t = 1,
+        help = "Amount of workers simultaneously requesting time slices from source"
     )]
     simul_batches: usize,
 
     #[arg(
+        env = "SIMULTANEOUS_PAGES",
+        default_value_t = 100,
+        help = "Amount of workers simultaneously requesting tables from source"
+    )]
+    simul_pages: usize,
+
+    #[arg(
         env = "CHANNEL_SIZE",
-        default_value_t = 20,
+        default_value_t = 500,
         help = "Size of sink queue containing the responses from source"
     )]
     channel_size: usize,
 
     #[arg(
         env = "BATCH_MINUTES",
-        default_value_t = 5,
+        default_value_t = 15,
         help = "Duration in minutes of time slice to request at a time (within the bound of max rows)"
     )]
     batch_minutes: i64,
 
     #[arg(
         env = "PAGE_MAX_ROW_AMOUNT",
-        default_value_t = 400000usize,
+        default_value_t = 1000000usize,
         help = "Maximum amount of rows in a single request"
     )]
     max_rows: usize,
@@ -91,7 +98,7 @@ struct Args {
     request_retries: usize,
 
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -118,22 +125,22 @@ async fn main() {
     let is_running = Arc::new(Mutex::new(()));
 
     match &args.command {
-        Some(Commands::Sync) => {
+        Commands::Sync => {
             wrap_task("Partial Sync", || async move {
                 sync(args.clone(), SyncType::Partial).await
             })
             .await;
         }
-        Some(Commands::FullSync) => {
+        Commands::FullSync => {
             wrap_task("Full sync", || async move {
                 sync(args.clone(), SyncType::Full).await
             })
             .await;
         }
-        Some(Commands::Run {
+        Commands::Run {
             interval_minutes,
             sync_first,
-        }) => {
+        } => {
             let initial_args = args.clone();
             if *sync_first {
                 wrap_task("Initial Partial Sync", || async move {
@@ -163,7 +170,6 @@ async fn main() {
                 tokio::time::sleep(Duration::milliseconds(100).to_std().unwrap()).await;
             }
         }
-        None => {}
     }
 }
 
@@ -241,9 +247,12 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                     &read_args.influx_src_bucket,
                     batches,
                     tx,
-                    read_args.simul_batches,
-                    read_args.max_rows,
-                    read_args.request_retries,
+                    ReadConfig {
+                        simul_batches: read_args.simul_batches,
+                        max_rows: read_args.max_rows,
+                        retries: read_args.request_retries,
+                        simul_pages: read_args.simul_pages,
+                    },
                 )
                 .await
             });
@@ -308,23 +317,24 @@ async fn write_batch(
     client: &Client,
     org: &str,
     bucket: &str,
-    item: Arc<QueryTableIter>,
+    item: Arc<Input>,
 ) -> Result<(), Error> {
     let first = item
+        .1
         .result()
         .next()
         .map(|rec| rec.and_then(|r| r.values.get("_time").cloned()));
     let mut buffer = bytes::BytesMut::new();
     let vals = stream! {
-        for value in item.result().iterator() {
-            yield value
+        for value in item.1.result().iterator() {
+            yield (value, item.clone())
         }
     };
 
-    let x = vals.map(move |record| match record {
+    let x = vals.map(move |(record, item)| match record {
         Ok(rec) => {
             let mut w = (&mut buffer).writer();
-            LPRecord(rec).write_data_point_to(&mut w)?;
+            LPRecord(rec).write_data_point_to(&mut w, &item.0)?;
             w.flush()?;
             Ok::<_, io::Error>(buffer.split().freeze())
         }
@@ -375,16 +385,21 @@ fn batches(
         .tuple_windows()
 }
 
-type Input = QueryRes;
+#[derive(Clone, Copy)]
+struct ReadConfig {
+    simul_batches: usize,
+    max_rows: usize,
+    retries: usize,
+    simul_pages: usize,
+}
+type Input = (Table, QueryRes);
 
 async fn stream_batches<'a>(
     client: &'a Client,
     bucket: &'a str,
     batches: Vec<Batch>,
     tx: mpsc::Sender<Arc<Input>>,
-    simul_batches: usize,
-    max_rows: usize,
-    retries: usize,
+    read_config: ReadConfig,
 ) -> Result<(), Error> {
     let mut futs = FuturesOrdered::new();
 
@@ -394,17 +409,14 @@ async fn stream_batches<'a>(
     let len = batches.len();
 
     for (i, (start, stop)) in batches.iter().enumerate() {
-        let fut = async move { stream_batch(client, bucket, start, stop, max_rows, retries).await };
+        let tx = tx.clone();
+        let fut = async move { stream_batch(&tx, client, bucket, start, stop, read_config).await };
         futs.push_back(fut);
 
-        if futs.len() == simul_batches {
-            let results = futs.next().await.unwrap()?; // unwrap is safe, because it is preceeded by a length check
-            for i in results.iter() {
-                let val: Arc<QueryTableIter> = Arc::new(i.clone());
-                tx.send(val.clone()).await?;
-            }
+        if futs.len() == read_config.simul_batches {
+            futs.next().await.unwrap()?; // unwrap is safe, because it is preceeded by a length check
         }
-        if i % simul_batches == 0 {
+        if i % read_config.simul_batches == 0 {
             let end = Instant::now();
             let seconds = (end - begin).as_secs_f64();
             if let Some(f) = first {
@@ -425,10 +437,7 @@ async fn stream_batches<'a>(
     }
 
     while let Some(item) = futs.next().await {
-        for i in item?.iter() {
-            let val: Arc<QueryTableIter> = Arc::new(i.clone());
-            tx.send(val.clone()).await?;
-        }
+        item?;
     }
     Ok(())
 }
@@ -442,14 +451,119 @@ impl Display for BatchStart {
     }
 }
 
+type QueryRes = QueryTableIter;
+
+enum BatchResult {
+    Finished(QueryRes),
+    Unfinished(QueryRes, BatchStart),
+}
+
 async fn stream_batch(
+    tx: &mpsc::Sender<Arc<Input>>,
     client: &Client,
     bucket: &str,
     start: &DateTime<FixedOffset>,
     stop: &DateTime<FixedOffset>,
+    read_config: ReadConfig,
+) -> Result<(), Error> {
+    let tables = read_batch_tables(client, bucket, start, stop).await?;
+    let mut futures = FuturesUnordered::new();
+    for table in tables {
+        let future = read_table_batches(
+            client,
+            bucket,
+            start,
+            stop,
+            table,
+            read_config.max_rows,
+            read_config.retries,
+        );
+        futures.push(future);
+        if futures.len() == read_config.simul_pages {
+            let (table, results) = futures.next().await.unwrap()?; // unwrap is safe, because it is preceeded by a length check
+            for i in results.iter() {
+                let val: Arc<Input> = Arc::new((table.to_owned(), i.clone()));
+                tx.send(val.clone()).await?;
+            }
+        }
+    }
+    while let Some(item) = futures.next().await {
+        let (table, query_results) = item?;
+        for result in query_results.iter() {
+            let val: Arc<Input> = Arc::new((table.to_owned(), result.clone()));
+            tx.send(val.clone()).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct Table {
+    record: FluxRecord,
+}
+
+impl Table {
+    fn new(record: &FluxRecord) -> Table {
+        Table {
+            record: record.to_owned(),
+        }
+    }
+
+    fn filter(&self) -> TableFilter {
+        let clauses = self
+            .record
+            .values
+            .iter()
+            .filter(|(column, _)| *column != "_time" && *column != "_value" && *column != "result")
+            .filter_map(|(column, value)| match value {
+                Value::String(str) => Some((column, str)),
+                _ => None,
+            })
+            .map(|(column, value)| format!("r[\"{column}\"] == \"{value}\""))
+            .join(" and ");
+        TableFilter {
+            query_part: format!("filter(fn: (r) => {clauses})"),
+        }
+    }
+}
+
+struct TableFilter {
+    query_part: String,
+}
+
+impl Display for TableFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.query_part.as_str())
+    }
+}
+
+async fn read_batch_tables(
+    client: &Client,
+    bucket: &str,
+    start: &DateTime<FixedOffset>,
+    stop: &DateTime<FixedOffset>,
+) -> Result<Vec<Table>, Error> {
+    let start_str = start.to_rfc3339();
+    let stop_str = stop.to_rfc3339();
+    let qs = format!(
+        "from(bucket: \"{bucket}\")
+        |> range(start: {start_str}, stop: {stop_str})
+        |> drop(columns: [\"_start\", \"_stop\"])
+        |> limit(n: 1)"
+    );
+    let rows = client.query_raw(Some(Query::new(qs))).await?;
+    Ok(rows.iter().map(Table::new).collect_vec())
+}
+
+async fn read_table_batches(
+    client: &Client,
+    bucket: &str,
+    start: &DateTime<FixedOffset>,
+    stop: &DateTime<FixedOffset>,
+    table: Table,
     max_rows: usize,
     retries: usize,
-) -> Result<Vec<QueryRes>, Error> {
+) -> Result<(Table, Vec<QueryRes>), Error> {
     let mut offset = BatchStart(0);
     let mut results: Vec<QueryRes> = Vec::new();
     loop {
@@ -457,7 +571,7 @@ async fn stream_batch(
             .map(jitter)
             .take(retries);
         match Retry::spawn(retry_strategy, || {
-            read_batch(client, bucket, start, stop, offset, max_rows)
+            read_table_batch(client, bucket, start, stop, &table, offset, max_rows)
         })
         .await?
         {
@@ -471,21 +585,15 @@ async fn stream_batch(
             }
         }
     }
-    Ok(results)
+    Ok((table.to_owned(), results))
 }
 
-type QueryRes = QueryTableIter;
-
-enum BatchResult {
-    Finished(QueryRes),
-    Unfinished(QueryRes, BatchStart),
-}
-
-async fn read_batch(
+async fn read_table_batch(
     client: &Client,
     bucket: &str,
     start: &DateTime<FixedOffset>,
     stop: &DateTime<FixedOffset>,
+    table: &Table,
     offset: BatchStart,
     max_rows: usize,
 ) -> Result<BatchResult, Error> {
@@ -494,10 +602,12 @@ async fn read_batch(
     let qs = format!(
         "from(bucket: \"{bucket}\")
         |> range(start: {start_str}, stop: {stop_str})
-        |> drop(columns: [\"_start\", \"_stop\"])
-        |> group()
-        |> limit(n: {max_rows}, offset: {offset})"
+        |> {}
+        |> limit(n: {max_rows}, offset: {offset})
+        |> keep(columns: [\"_time\", \"value\"])",
+        table.filter()
     );
+    debug!("Querying {qs}");
     let query_res = client.query_raw_iter(Some(Query::new(qs))).await?;
     if query_res.is_empty() {
         Ok(BatchResult::Finished(query_res))
@@ -511,6 +621,37 @@ async fn read_batch(
 
 #[derive(Clone)]
 struct LPRecord(FluxRecord);
+
+impl LPRecord {
+    fn write_data_point_to<W>(&self, mut w: W, table: &Table) -> std::io::Result<()>
+    where
+        W: std::io::Write,
+    {
+        match (
+            table.record.values.get("_measurement"),
+            table.record.values.get("_field"),
+            self.0.values.get("_time"),
+            self.0.values.get("_value"),
+        ) {
+            (Some(m), Some(f), Some(t), Some(v)) => {
+                write!(w, "{}", LPValue::new(m))?;
+                for (k, v) in table
+                    .record
+                    .values
+                    .iter()
+                    .filter(|(k, _)| !matches!(k.chars().next(), Some('_') | None))
+                    .filter(|(_, v)| !matches!(v, Value::String(x) if x.is_empty()))
+                    .filter(|(k, _)| !matches!(k.as_str(), "result" | "table"))
+                {
+                    write!(w, ",{}={}", k, LPValue(v))?;
+                }
+                writeln!(w, " {}={} {}", LPValue(f), LPValue(v), LPValue(t))?;
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
 struct LPValue<'a>(&'a Value);
 
@@ -532,36 +673,5 @@ impl<'a> Display for LPValue<'a> {
 impl<'a> LPValue<'a> {
     fn new(val: &'a Value) -> LPValue<'a> {
         return LPValue(val);
-    }
-}
-
-impl WriteDataPoint for LPRecord {
-    fn write_data_point_to<W>(&self, mut w: W) -> std::io::Result<()>
-    where
-        W: std::io::Write,
-    {
-        match (
-            self.0.values.get("_measurement"),
-            self.0.values.get("_field"),
-            self.0.values.get("_time"),
-            self.0.values.get("_value"),
-        ) {
-            (Some(m), Some(f), Some(t), Some(v)) => {
-                write!(w, "{}", LPValue::new(m))?;
-                for (k, v) in self
-                    .0
-                    .values
-                    .iter()
-                    .filter(|(k, _)| !matches!(k.chars().next(), Some('_') | None))
-                    .filter(|(_, v)| !matches!(v, Value::String(x) if x.is_empty()))
-                    .filter(|(k, _)| !matches!(k.as_str(), "result" | "table"))
-                {
-                    write!(w, ",{}={}", k, LPValue(v))?;
-                }
-                writeln!(w, " {}={} {}", LPValue(f), LPValue(v), LPValue(t))?;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
     }
 }
