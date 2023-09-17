@@ -78,7 +78,7 @@ struct Args {
 
     #[arg(
         env = "BATCH_MINUTES",
-        default_value_t = 15,
+        default_value_t = 5,
         help = "Duration in minutes of time slice to request at a time (within the bound of max rows)"
     )]
     batch_minutes: i64,
@@ -96,6 +96,15 @@ struct Args {
         help = "Number of retries made to reads and writes"
     )]
     request_retries: usize,
+
+    #[arg(
+        short,
+        long,
+        env = "READ_ONLY",
+        default_value_t = false,
+        help = "Disables the writing to sink. Can be useful to identify whether the replication is bottlenecked by reading or writing"
+    )]
+    read_only: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -258,16 +267,25 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
             });
 
             let write_args = args.clone();
-            let write = tokio::spawn(async move {
-                write_batches(
-                    &sink_client,
-                    &write_args.influx_sink_org,
-                    &write_args.influx_sink_bucket,
-                    &mut rx,
-                    write_args.request_retries,
-                )
-                .await
-            });
+            let write = if args.read_only {
+                tokio::spawn(async move {
+                    while (rx.recv().await).is_some() {
+                        // ignore results
+                    }
+                    Ok(())
+                })
+            } else {
+                tokio::spawn(async move {
+                    write_batches(
+                        &sink_client,
+                        &write_args.influx_sink_org,
+                        &write_args.influx_sink_bucket,
+                        &mut rx,
+                        write_args.request_retries,
+                    )
+                    .await
+                })
+            };
 
             let (read_res, write_res) = join!(read, write);
             write_res??;
