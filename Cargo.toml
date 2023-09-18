@@ -15,12 +15,12 @@ futures = "0.3.28"
 fallible-iterator = "0.2.0"
 influxdb2-structmap = { git = "https://github.com/foundation-zero/influxdb2.git" }
 itertools = "0.11.0"
-tokio = { version = "1.29.1", features = ["rt", "rt-multi-thread", "macros"], default-features = false }
+tokio = { version = "1.29.1", features = ["rt", "rt-multi-thread", "macros", "io-util"], default-features = false }
 tokio-stream = "0.1.14"
 thiserror = "1.0.45"
 clap = { version = "4.3.21", features = ["derive", "env"] }
 env_logger = "0.10.0"
 log = "0.4.20"
-influxdb2 = { git = "https://github.com/foundation-zero/influxdb2.git", features = ["rustls"], default-features = false }
+influxdb2 = { git = "https://github.com/foundation-zero/influxdb2.git", features = ["rustls", "gzip"], default-features = false }
 reqwest = { version = "0.11.18", default-features = false, features = ["stream", "rustls-tls"] }
 tokio-retry = "0.3.0"

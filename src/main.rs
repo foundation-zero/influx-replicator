@@ -1,5 +1,5 @@
 use std::fmt::Display;
-use std::io::{self, Write};
+use std::io::BufWriter;
 use std::iter;
 
 use std::sync::Arc;
@@ -16,19 +16,17 @@ use fallible_iterator::FallibleIterator;
 use futures::stream::{FuturesOrdered, FuturesUnordered};
 use futures::{join, Future, StreamExt};
 use influxdb2::api::query::{FluxRecord, QueryTableIter};
-use influxdb2::models::Query;
-use influxdb2::Client;
+use influxdb2::models::{Query, WriteDataPoint};
+use influxdb2::{Client, ClientBuilder};
 use influxdb2_structmap::value::Value;
 use itertools::Itertools;
 use log::{debug, error, info, LevelFilter};
-use reqwest::Body;
 use tokio::pin;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::Mutex;
 
 use clap::{Parser, Subcommand};
 
-use bytes::BufMut;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tokio_retry::Retry;
 
@@ -223,16 +221,20 @@ enum SyncType {
 }
 
 async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
-    let src_client = Client::new(
+    let src_client = ClientBuilder::new(
         &args.influx_src_url,
         &args.influx_src_org,
         &args.influx_src_token,
-    );
-    let sink_client = Client::new(
+    )
+    .gzip(false)
+    .build()?;
+    let sink_client = ClientBuilder::new(
         &args.influx_sink_url,
         &args.influx_sink_org,
         &args.influx_sink_token,
-    );
+    )
+    .gzip(false)
+    .build()?;
 
     let (first_source_res, latest_source_res, latest_dest_res) = join!(
         get_edge(&src_client, &args.influx_src_bucket, Edge::First),
@@ -286,7 +288,6 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                 tokio::spawn(async move {
                     write_batches(
                         &sink_client,
-                        &write_args.influx_sink_org,
                         &write_args.influx_sink_bucket,
                         &mut rx,
                         write_args.request_retries,
@@ -340,36 +341,29 @@ async fn get_edge(
     }))
 }
 
-async fn write_batch(
-    client: &Client,
-    org: &str,
-    bucket: &str,
-    item: Arc<Input>,
-) -> Result<(), Error> {
+async fn write_batch(client: &Client, bucket: &str, item: Arc<Input>) -> Result<(), Error> {
     let first = item
         .1
         .result()
         .next()
         .map(|rec| rec.and_then(|r| r.values.get("_time").cloned()));
-    let mut buffer = bytes::BytesMut::new();
     let vals = stream! {
         for value in item.1.result().iterator() {
             yield (value, item.clone())
         }
     };
 
-    let x = vals.map(move |(record, item)| match record {
-        Ok(rec) => {
-            let mut w = (&mut buffer).writer();
-            LPRecord(rec).write_data_point_to(&mut w, &item.0)?;
-            w.flush()?;
-            Ok::<_, io::Error>(buffer.split().freeze())
+    let body = vals.filter_map(|(record, item)| async move {
+        match record {
+            Ok(rec) => {
+                let rec = LPRecord(rec, Arc::new(item.0.record.clone()));
+                Some(rec)
+            }
+            Err(_) => None,
         }
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
     });
-    let body: Body = Body::wrap_stream(x);
 
-    client.write_line_protocol(org, bucket, body).await?;
+    client.write(bucket, body).await?;
     if let Ok(Some(Value::TimeRFC(t))) = first {
         debug!("Wrote from {}", t.to_rfc3339());
     };
@@ -378,7 +372,6 @@ async fn write_batch(
 
 async fn write_batches(
     client: &Client,
-    org: &str,
     bucket: &str,
     rx: &mut Receiver<Arc<Input>>,
     retries: usize,
@@ -395,10 +388,7 @@ async fn write_batches(
                 .map(jitter)
                 .take(retries);
 
-            Retry::spawn(retry_strategy, || {
-                write_batch(client, org, bucket, item.clone())
-            })
-            .await
+            Retry::spawn(retry_strategy, || write_batch(client, bucket, item.clone())).await
         })
         .buffered(simul_writes);
 
@@ -647,7 +637,7 @@ async fn read_table_batch(
         |> range(start: {start_str}, stop: {stop_str})
         |> {}
         |> limit(n: {max_rows}, offset: {offset})
-        |> keep(columns: [\"_time\", \"value\"])",
+        |> keep(columns: [\"_time\", \"_value\"])",
         table.filter()
     );
     debug!("Querying {qs}");
@@ -663,23 +653,23 @@ async fn read_table_batch(
 }
 
 #[derive(Clone)]
-struct LPRecord(FluxRecord);
+struct LPRecord(FluxRecord, Arc<FluxRecord>);
 
-impl LPRecord {
-    fn write_data_point_to<W>(&self, mut w: W, table: &Table) -> std::io::Result<()>
+impl WriteDataPoint for LPRecord {
+    fn write_data_point_to<W>(&self, mut w: W) -> std::io::Result<()>
     where
         W: std::io::Write,
     {
         match (
-            table.record.values.get("_measurement"),
-            table.record.values.get("_field"),
+            self.1.values.get("_measurement"),
+            self.1.values.get("_field"),
             self.0.values.get("_time"),
             self.0.values.get("_value"),
         ) {
             (Some(m), Some(f), Some(t), Some(v)) => {
                 write!(w, "{}", LPValue::new(m))?;
-                for (k, v) in table
-                    .record
+                for (k, v) in self
+                    .1
                     .values
                     .iter()
                     .filter(|(k, _)| !matches!(k.chars().next(), Some('_') | None))
@@ -693,6 +683,20 @@ impl LPRecord {
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl Display for LPRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut buf = BufWriter::new(Vec::new());
+        self.write_data_point_to(&mut buf)
+            .map_err(|_| std::fmt::Error)?;
+        let bytes = buf.into_inner().map_err(|_| std::fmt::Error)?;
+        f.write_str(
+            String::from_utf8(bytes)
+                .map_err(|_| std::fmt::Error)?
+                .as_str(),
+        )
     }
 }
 
