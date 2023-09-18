@@ -22,6 +22,7 @@ use influxdb2_structmap::value::Value;
 use itertools::Itertools;
 use log::{debug, error, info, LevelFilter};
 use reqwest::Body;
+use tokio::pin;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::sync::Mutex;
 
@@ -68,6 +69,13 @@ struct Args {
         help = "Amount of workers simultaneously requesting tables from source"
     )]
     simul_pages: usize,
+
+    #[arg(
+        env = "SIMULTANEOUS_WRITES",
+        default_value_t = 10,
+        help = "Amount of workers simultaneously writing to sink"
+    )]
+    simul_writes: usize,
 
     #[arg(
         env = "CHANNEL_SIZE",
@@ -282,6 +290,7 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                         &write_args.influx_sink_bucket,
                         &mut rx,
                         write_args.request_retries,
+                        write_args.simul_writes,
                     )
                     .await
                 })
@@ -373,16 +382,30 @@ async fn write_batches(
     bucket: &str,
     rx: &mut Receiver<Arc<Input>>,
     retries: usize,
+    simul_writes: usize,
 ) -> Result<(), Error> {
-    while let Some(item) = rx.recv().await {
-        let retry_strategy = ExponentialBackoff::from_millis(100)
-            .map(jitter)
-            .take(retries);
+    let stream = stream! {
+        while let Some(item) = rx.recv().await {
+            yield item
+        }
+    };
+    let stream = stream
+        .map(|item| async move {
+            let retry_strategy = ExponentialBackoff::from_millis(100)
+                .map(jitter)
+                .take(retries);
 
-        Retry::spawn(retry_strategy, || {
-            write_batch(client, org, bucket, item.clone())
+            Retry::spawn(retry_strategy, || {
+                write_batch(client, org, bucket, item.clone())
+            })
+            .await
         })
-        .await?;
+        .buffered(simul_writes);
+
+    pin!(stream);
+
+    while let Some(res) = stream.next().await {
+        res?;
     }
     Ok(())
 }
@@ -427,8 +450,9 @@ async fn stream_batches<'a>(
     let len = batches.len();
 
     for (i, (start, stop)) in batches.iter().enumerate() {
-        let tx = tx.clone();
-        let fut = async move { stream_batch(&tx, client, bucket, start, stop, read_config).await };
+        let new_tx = tx.clone();
+        let fut =
+            async move { stream_batch(&new_tx, client, bucket, start, stop, read_config).await };
         futs.push_back(fut);
 
         if futs.len() == read_config.simul_batches {
@@ -440,13 +464,14 @@ async fn stream_batches<'a>(
             if let Some(f) = first {
                 let processed_duration = stop.signed_duration_since(*f).num_seconds();
                 info!(
-                    "Batch {} / {}, {}% At {} took {:.2} seconds speed up {:.2}x",
+                    "Batch {} / {}, {}% At {} took {:.2} seconds speed up {:.2}x queue capacity {}",
                     i,
                     len,
                     i / len,
                     start,
                     seconds,
-                    (processed_duration as f64) / seconds
+                    (processed_duration as f64) / seconds,
+                    tx.capacity()
                 );
             };
             first = Some(start);
