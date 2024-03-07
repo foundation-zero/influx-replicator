@@ -464,10 +464,10 @@ async fn stream_batches<'a>(
             if let Some(f) = first {
                 let processed_duration = stop.signed_duration_since(*f).num_seconds();
                 info!(
-                    "Batch {} / {}, {}% At {} took {:.2} seconds speed up {:.2}x queue capacity {}",
+                    "Batch {} / {}, {:.2}% At {} took {:.2} seconds speed up {:.2}x queue capacity {}",
                     i,
                     len,
-                    i / len,
+                    100.0 * i as f64 / len as f64,
                     start,
                     seconds,
                     (processed_duration as f64) / seconds,
