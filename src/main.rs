@@ -41,6 +41,8 @@ struct Args {
     influx_src_token: String,
     #[arg(env = "INFLUXDB_SOURCE_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_src_bucket: String,
+    #[arg(env = "INFLUXDB_SOURCE_TIMEOUT_SECONDS")]
+    influx_src_timeout_seconds: u64,
 
     #[arg(env = "INFLUXDB_SINK_URL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_url: String,
@@ -50,6 +52,8 @@ struct Args {
     influx_sink_token: String,
     #[arg(env = "INFLUXDB_SINK_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
     influx_sink_bucket: String,
+    #[arg(env = "INFLUXDB_SINK_TIMEOUT_SECONDS")]
+    influx_sink_timeout_seconds: u64,
 
     #[arg(short, long, env= "LOG_LEVEL", default_value_t=LevelFilter::Info)]
     log_level: LevelFilter,
@@ -221,14 +225,20 @@ enum SyncType {
 }
 
 async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
-    let src_client = ClientBuilder::new(
+    let src_client = ClientBuilder::with_builder(
+        reqwest::ClientBuilder::new().timeout(std::time::Duration::from_secs(
+            args.influx_src_timeout_seconds,
+        )),
         &args.influx_src_url,
         &args.influx_src_org,
         &args.influx_src_token,
     )
     .gzip(false)
     .build()?;
-    let sink_client = ClientBuilder::new(
+    let sink_client = ClientBuilder::with_builder(
+        reqwest::ClientBuilder::new().timeout(std::time::Duration::from_secs(
+            args.influx_sink_timeout_seconds,
+        )),
         &args.influx_sink_url,
         &args.influx_sink_org,
         &args.influx_sink_token,
@@ -454,10 +464,10 @@ async fn stream_batches<'a>(
             if let Some(f) = first {
                 let processed_duration = stop.signed_duration_since(*f).num_seconds();
                 info!(
-                    "Batch {} / {}, {}% At {} took {:.2} seconds speed up {:.2}x queue capacity {}",
+                    "Batch {} / {}, {:.2}% At {} took {:.2} seconds speed up {:.2}x queue capacity {}",
                     i,
                     len,
-                    i / len,
+                    100.0 * i as f64 / len as f64,
                     start,
                     seconds,
                     (processed_duration as f64) / seconds,
