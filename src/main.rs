@@ -33,77 +33,124 @@ use tokio_retry::Retry;
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about=None)]
 struct Args {
-    #[arg(env = "INFLUXDB_SOURCE_URL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_src_url: String,
-    #[arg(env = "INFLUXDB_SOURCE_ORGANISATION", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_src_org: String,
-    #[arg(env = "INFLUXDB_SOURCE_TOKEN", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_src_token: String,
-    #[arg(env = "INFLUXDB_SOURCE_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_src_bucket: String,
-    #[arg(env = "INFLUXDB_SOURCE_TIMEOUT_SECONDS")]
-    influx_src_timeout_seconds: u64,
+    #[arg(
+        env = "INFLUXDB_SOURCE_URL",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "URL of the source InfluxDB instance, e.g. https://influxdb:8086"
+    )]
+    influxdb_source_url: String,
+    #[arg(
+        env = "INFLUXDB_SOURCE_ORGANISATION",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "Organisation name on the source InfluxDB"
+    )]
+    influxdb_source_organisation: String,
+    #[arg(
+        env = "INFLUXDB_SOURCE_TOKEN",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "API token with read access to the source bucket"
+    )]
+    influxdb_source_token: String,
+    #[arg(
+        env = "INFLUXDB_SOURCE_BUCKET",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "Bucket to replicate from"
+    )]
+    influxdb_source_bucket: String,
 
-    #[arg(env = "INFLUXDB_SINK_URL", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_sink_url: String,
-    #[arg(env = "INFLUXDB_SINK_ORGANISATION", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_sink_org: String,
-    #[arg(env = "INFLUXDB_SINK_TOKEN", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_sink_token: String,
-    #[arg(env = "INFLUXDB_SINK_BUCKET", value_parser = clap::builder::NonEmptyStringValueParser::new())]
-    influx_sink_bucket: String,
-    #[arg(env = "INFLUXDB_SINK_TIMEOUT_SECONDS")]
-    influx_sink_timeout_seconds: u64,
+    #[arg(
+        env = "INFLUXDB_SINK_URL",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "URL of the sink InfluxDB instance, e.g. https://influxdb:8086"
+    )]
+    influxdb_sink_url: String,
+    #[arg(
+        env = "INFLUXDB_SINK_ORGANISATION",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "Organisation name on the sink InfluxDB"
+    )]
+    influxdb_sink_organisation: String,
+    #[arg(
+        env = "INFLUXDB_SINK_TOKEN",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "API token with write access to the sink bucket"
+    )]
+    influxdb_sink_token: String,
+    #[arg(
+        env = "INFLUXDB_SINK_BUCKET",
+        value_parser = clap::builder::NonEmptyStringValueParser::new(),
+        help = "Bucket to replicate into"
+    )]
+    influxdb_sink_bucket: String,
 
-    #[arg(short, long, env= "LOG_LEVEL", default_value_t=LevelFilter::Info)]
+    #[arg(
+        env = "INFLUXDB_SOURCE_TIMEOUT_SECONDS",
+        default_value_t = 60,
+        help = "HTTP request timeout for reads from source, in seconds. Set above your worst-case query time. Too low causes spurious retries; too high delays detection of a hung server. Range: 30-300"
+    )]
+    influxdb_source_timeout_seconds: u64,
+    #[arg(
+        env = "INFLUXDB_SINK_TIMEOUT_SECONDS",
+        default_value_t = 30,
+        help = "HTTP request timeout for writes to sink, in seconds. Writes are generally faster than reads so this can be lower than the source timeout. Range: 30-120"
+    )]
+    influxdb_sink_timeout_seconds: u64,
+
+    #[arg(
+        short,
+        long,
+        env = "LOG_LEVEL",
+        default_value_t = LevelFilter::Info,
+        help = "Log verbosity. 'info' logs batch progress; 'debug' logs every Flux query sent to source (verbose)"
+    )]
     log_level: LevelFilter,
 
     #[arg(
         env = "SIMULTANEOUS_BATCHES",
         default_value_t = 1,
-        help = "Amount of workers simultaneously requesting time slices from source"
+        help = "Number of time-slice batches fetched from source concurrently. Higher values increase read throughput when the source can handle concurrent queries but raise peak memory use. Increase only if the source is the bottleneck. Range: 1-8"
     )]
     simul_batches: usize,
 
     #[arg(
         env = "SIMULTANEOUS_PAGES",
         default_value_t = 100,
-        help = "Amount of workers simultaneously requesting tables from source"
+        help = "Number of table pages fetched concurrently within a single batch. Each table in a time slice is fetched independently; this caps how many are in-flight at once. High values saturate the source faster but use more connections and memory. Range: 10-200"
     )]
     simul_pages: usize,
 
     #[arg(
         env = "SIMULTANEOUS_WRITES",
         default_value_t = 10,
-        help = "Amount of workers simultaneously writing to sink"
+        help = "Number of write requests sent to sink concurrently. Increase when network RTT to the sink is high (parallelism hides latency). Decrease if the sink is overwhelmed. Range: 1-50"
     )]
     simul_writes: usize,
 
     #[arg(
         env = "CHANNEL_SIZE",
         default_value_t = 500,
-        help = "Size of sink queue containing the responses from source"
+        help = "Capacity of the in-process queue between readers and writers. Larger values smooth out speed differences at the cost of memory. Below ~100 risks stalling the reader; above ~2000 the extra buffering rarely helps. Range: 100-2000"
     )]
     channel_size: usize,
 
     #[arg(
         env = "BATCH_MINUTES",
         default_value_t = 5,
-        help = "Duration in minutes of time slice to request at a time (within the bound of max rows)"
+        help = "Width of each time slice queried from source, in minutes. Smaller values mean more round-trips but smaller, faster queries. If a batch consistently hits PAGE_MAX_ROW_AMOUNT, reduce this to split the data across more batches. Range: 1-60"
     )]
     batch_minutes: i64,
 
     #[arg(
         env = "PAGE_MAX_ROW_AMOUNT",
         default_value_t = 1000000usize,
-        help = "Maximum amount of rows in a single request"
+        help = "Maximum rows returned in a single Flux query. If a table within a batch exceeds this, the replicator pages automatically. Very high values risk OOM on source or replicator; very low values create excessive round-trips. Range: 100000-5000000"
     )]
     max_rows: usize,
 
     #[arg(
         env = "REQUEST_RETRIES",
         default_value_t = 3,
-        help = "Number of retries made to reads and writes"
+        help = "Number of times a failed read or write is retried using exponential back-off starting at 100ms with jitter. Set to 0 to fail fast during debugging. Range: 0-10"
     )]
     request_retries: usize,
 
@@ -112,7 +159,7 @@ struct Args {
         long,
         env = "READ_ONLY",
         default_value_t = false,
-        help = "Disables the writing to sink. Can be useful to identify whether the replication is bottlenecked by reading or writing"
+        help = "When true, reads proceed normally but nothing is written to sink. Useful for measuring whether the bottleneck is on the read or write side"
     )]
     read_only: bool,
 
@@ -125,10 +172,18 @@ enum Commands {
     Sync,
     FullSync,
     Run {
-        #[arg(env = "INTERVAL_MINUTES", default_value_t = 5)]
+        #[arg(
+            env = "INTERVAL_MINUTES",
+            default_value_t = 5,
+            help = "How often to trigger a partial sync, in minutes. Should be comfortably larger than a typical sync duration. If a sync is still running when the next interval fires, the new run is silently skipped. Range: 1-60"
+        )]
         interval_minutes: u32,
 
-        #[arg(env = "SYNC_FIRST", default_value_t = true)]
+        #[arg(
+            env = "SYNC_FIRST",
+            default_value_t = true,
+            help = "When true, runs an immediate partial sync at startup before the first scheduled interval. Catches up on data written since the service last ran"
+        )]
         sync_first: bool,
     },
 }
@@ -227,29 +282,29 @@ enum SyncType {
 async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
     let src_client = ClientBuilder::with_builder(
         reqwest::ClientBuilder::new().timeout(std::time::Duration::from_secs(
-            args.influx_src_timeout_seconds,
+            args.influxdb_source_timeout_seconds,
         )),
-        &args.influx_src_url,
-        &args.influx_src_org,
-        &args.influx_src_token,
+        &args.influxdb_source_url,
+        &args.influxdb_source_organisation,
+        &args.influxdb_source_token,
     )
     .gzip(false)
     .build()?;
     let sink_client = ClientBuilder::with_builder(
         reqwest::ClientBuilder::new().timeout(std::time::Duration::from_secs(
-            args.influx_sink_timeout_seconds,
+            args.influxdb_sink_timeout_seconds,
         )),
-        &args.influx_sink_url,
-        &args.influx_sink_org,
-        &args.influx_sink_token,
+        &args.influxdb_sink_url,
+        &args.influxdb_sink_organisation,
+        &args.influxdb_sink_token,
     )
     .gzip(false)
     .build()?;
 
     let (first_source_res, latest_source_res, latest_dest_res) = join!(
-        get_edge(&src_client, &args.influx_src_bucket, Edge::First),
-        get_edge(&src_client, &args.influx_src_bucket, Edge::Last),
-        get_edge(&sink_client, &args.influx_sink_bucket, Edge::Last)
+        get_edge(&src_client, &args.influxdb_source_bucket, Edge::First),
+        get_edge(&src_client, &args.influxdb_source_bucket, Edge::Last),
+        get_edge(&sink_client, &args.influxdb_sink_bucket, Edge::Last)
     );
     let first_source = first_source_res?;
     let latest_source = latest_source_res?;
@@ -273,7 +328,7 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
             let read = tokio::spawn(async move {
                 stream_batches(
                     &src_client,
-                    &read_args.influx_src_bucket,
+                    &read_args.influxdb_source_bucket,
                     batches,
                     tx,
                     ReadConfig {
@@ -298,7 +353,7 @@ async fn sync(args: Arc<Args>, sync: SyncType) -> Result<(), Error> {
                 tokio::spawn(async move {
                     write_batches(
                         &sink_client,
-                        &write_args.influx_sink_bucket,
+                        &write_args.influxdb_sink_bucket,
                         &mut rx,
                         write_args.request_retries,
                         write_args.simul_writes,
@@ -729,6 +784,6 @@ impl<'a> Display for LPValue<'a> {
 
 impl<'a> LPValue<'a> {
     fn new(val: &'a Value) -> LPValue<'a> {
-        return LPValue(val);
+        LPValue(val)
     }
 }
