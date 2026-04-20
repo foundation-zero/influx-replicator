@@ -784,6 +784,6 @@ impl<'a> Display for LPValue<'a> {
 
 impl<'a> LPValue<'a> {
     fn new(val: &'a Value) -> LPValue<'a> {
-        return LPValue(val);
+        LPValue(val)
     }
 }
