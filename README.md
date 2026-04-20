@@ -28,6 +28,55 @@ The `run` command drops a scheduled sync if the previous one is still running. N
 
 For more information on all command line arguments, run `docker run ghcr.io/foundation-zero/influx-replicator:main --help`.
 
+## Local Development
+
+### Prerequisites
+
+- [Rust](https://rustup.rs/) (stable)
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+
+### Setup
+
+1. Copy the template and fill in your values:
+
+   ```sh
+   cp .env.template .env
+   ```
+
+   At minimum you need a real source InfluxDB (fill in the `INFLUXDB_SOURCE_*` vars) and a password + token for the local sink. See the comments in `.env.template` for constraints.
+
+2. Start the local sink:
+
+   ```sh
+   docker-compose up -d
+   ```
+
+   On first start, InfluxDB initialises itself using the `DOCKER_INFLUXDB_INIT_*` variables. Data is persisted in `./docker/influxdb/`.
+
+3. Run a one-off sync to verify everything connects:
+
+   ```sh
+   set -a && source .env && set +a && cargo run -- sync
+   ```
+
+   `set -a` exports all variables sourced from `.env` into the environment so the replicator can read them. Use `full-sync` instead of `sync` if the local sink is empty and you want to replicate everything from the source.
+
+4. For continuous replication, use the `run` command:
+
+   ```sh
+   set -a && source .env && set +a && cargo run -- run
+   ```
+
+### Resetting the local sink
+
+To wipe the local sink and start fresh:
+
+```sh
+docker-compose down
+docker volume rm influx-replicator_influxdb-data
+docker-compose up -d
+```
+
 ## Example Using `docker-compose`
 If you use `docker-compose`, the following should give you a starting point. Note that this assumes you define the envirnment variables in a `.env` file.
 
